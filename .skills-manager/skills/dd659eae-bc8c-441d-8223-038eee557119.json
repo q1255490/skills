@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "skill_id": "dd659eae-bc8c-441d-8223-038eee557119",
+  "path": "gh-address-comments",
+  "path_key": "gh-address-comments",
+  "enabled": true,
+  "tags": [],
+  "source": {
+    "type": "skillssh",
+    "ref": "openai/skills/gh-address-comments",
+    "subpath": "skills\\.curated\\gh-address-comments",
+    "branch": null
+  }
+}

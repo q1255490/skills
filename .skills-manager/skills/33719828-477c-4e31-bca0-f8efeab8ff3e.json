@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "skill_id": "33719828-477c-4e31-bca0-f8efeab8ff3e",
+  "path": "security-threat-model",
+  "path_key": "security-threat-model",
+  "enabled": true,
+  "tags": [],
+  "source": {
+    "type": "skillssh",
+    "ref": "openai/skills/security-threat-model",
+    "subpath": "skills\\.curated\\security-threat-model",
+    "branch": null
+  }
+}
