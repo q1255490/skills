@@ -1,0 +1,8 @@
+interface:
+  display_name: "Modao Prototype Inspector"
+  short_description: "Open a Modao link and capture structured evidence."
+  default_prompt: "Use $modao-prototype-inspector to inspect this Modao prototype link and capture overview, detail, and interaction evidence."
+
+policy:
+  allow_implicit_invocation: true
+

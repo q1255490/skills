@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "skill_id": "5b0a9a76-d350-471c-921a-d0fbbfbed7f3",
+  "path": "modao-prototype-inspector",
+  "path_key": "modao-prototype-inspector",
+  "enabled": true,
+  "tags": [],
+  "source": {
+    "type": "local",
+    "ref": null,
+    "subpath": null,
+    "branch": null
+  }
+}
