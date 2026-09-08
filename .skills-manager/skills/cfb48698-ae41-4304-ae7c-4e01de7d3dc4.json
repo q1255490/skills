@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "skill_id": "cfb48698-ae41-4304-ae7c-4e01de7d3dc4",
+  "path": "obsidian-markdown",
+  "path_key": "obsidian-markdown",
+  "enabled": true,
+  "tags": [],
+  "source": {
+    "type": "skillssh",
+    "ref": "kepano/obsidian-skills/obsidian-markdown",
+    "subpath": "skills\\obsidian-markdown",
+    "branch": null
+  }
+}
