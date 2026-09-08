@@ -8,6 +8,7 @@
     "codex": true,
     "gemini_cli": true,
     "junie": true,
-    "qoder": true
+    "qoder": true,
+    "zed": true
   }
 }
