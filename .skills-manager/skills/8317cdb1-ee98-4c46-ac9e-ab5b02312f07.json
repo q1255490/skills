@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "skill_id": "8317cdb1-ee98-4c46-ac9e-ab5b02312f07",
+  "path": "ub-mode",
+  "path_key": "ub-mode",
+  "enabled": true,
+  "tags": [],
+  "source": {
+    "type": "skillssh",
+    "ref": "unclebob/ub-mode/ub-mode",
+    "subpath": null,
+    "branch": null
+  }
+}
