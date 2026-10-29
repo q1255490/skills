@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "skill_id": "0630bb6a-41ad-4548-b483-364a89b56953",
+  "path": "book-to-skill",
+  "path_key": "book-to-skill",
+  "enabled": true,
+  "tags": [],
+  "source": {
+    "type": "skillssh",
+    "ref": "virgiliojr94/book-to-skill/book-to-skill",
+    "subpath": null,
+    "branch": null
+  }
+}
