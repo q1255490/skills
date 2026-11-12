@@ -7,6 +7,10 @@ import subprocess
 import sys
 from collections import Counter
 
+from book_to_skill.sanitize import sanitize_extracted_text
+
+_PART_HEADER = re.compile(r"^part\s+(?:\d+|[ivxlcdm]+)\b", re.IGNORECASE)
+
 # A bare page number sitting alone on a line: Arabic, or a Roman numeral of the
 # kind used to number front matter.
 #
@@ -25,6 +29,10 @@ from collections import Counter
 _ROMAN_1_99 = r"(?=[ivxl])(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3})"
 _PDF_PAGE_NUM = re.compile(rf"^\s*(?:\d{{1,4}}|{_ROMAN_1_99})\s*$", re.IGNORECASE)
 _PDF_HYPHEN_WRAP = re.compile(r"(\w)-\n(\w)")
+# A text-layer token with two decimal points can be two table cells whose
+# visual spacing was lost. It can also be legitimate notation: flag it, never
+# insert a guessed separator or alter the source text.
+_POSSIBLE_JOINED_DECIMALS = re.compile(r"(?<![\w.])\d+\.\d+\.\d+(?![\w.])")
 
 
 def clean_pdftotext(text: str) -> str:
@@ -128,6 +136,110 @@ def extract_with_pypdf(pdf_path: str) -> str | None:
     except Exception as e:
         print(f"  [warn] extract_with_pypdf failed: {type(e).__name__}: {e}", file=sys.stderr)
         return None
+
+
+def extract_pypdf_page_records(pdf_path: str) -> list[dict] | None:
+    """Extract physical pages independently for optional evidence citation.
+
+    This is intentionally separate from ``extract_with_pypdf``: the latter's
+    cross-page cleanup and its returned full text remain byte-for-byte stable.
+    Text-layer ordering is not a verified table layout or an offset into
+    ``full_text.txt``.
+    """
+    try:
+        import pypdf
+
+        records = []
+        with open(pdf_path, "rb") as stream:
+            reader = pypdf.PdfReader(stream)
+            for number, page in enumerate(reader.pages, start=1):
+                reasons = []
+                try:
+                    raw = page.extract_text() or ""
+                except Exception:
+                    raw = ""
+                    reasons.append("page_extraction_failed")
+                text, removed = sanitize_extracted_text(raw)
+                if removed:
+                    reasons.append("sanitized_invisible_text")
+                if not text.strip():
+                    reasons.append("empty_page_text")
+                if _POSSIBLE_JOINED_DECIMALS.search(text):
+                    reasons.append("possible_joined_decimal_cells")
+                records.append({
+                    "physical_page": number,
+                    "text": text,
+                    "extraction_method": "pypdf",
+                    "low_confidence_reasons": reasons,
+                    "requires_manual_review": bool(reasons),
+                })
+        return records
+    except ImportError:
+        return None
+    except Exception as exc:
+        print(
+            f"  [warn] extract_pypdf_page_records failed: "
+            f"{type(exc).__name__}: {exc}", file=sys.stderr,
+        )
+        return None
+
+
+def pdf_outline_titles(pdf_path: str) -> list[str]:
+    """Top-level titles from the PDF's embedded outline (bookmarks), or [] when
+    there is none or pypdf is unavailable. A top-level entry with children that
+    is a "Part" is replaced by its children, so "Part I > Chapter 1..7" yields
+    the chapters, not the parts."""
+    try:
+        import pypdf
+        reader = pypdf.PdfReader(pdf_path)
+        outline = reader.outline
+    except Exception:
+        return []
+    titles = []
+    for index, item in enumerate(outline):
+        if isinstance(item, list):
+            continue  # children of the preceding entry
+        title = (getattr(item, "title", "") or "").strip()
+        children = outline[index + 1] if index + 1 < len(outline) else None
+        if _PART_HEADER.match(title) and isinstance(children, list):
+            titles.extend(
+                (c.title or "").strip() for c in children if not isinstance(c, list)
+            )
+        elif title:
+            titles.append(title)
+    return [t for t in titles if t]
+
+
+def pdf_outline_all_titles(pdf_path: str) -> list[str]:
+    """Every bookmark title from the PDF outline, in document order."""
+    try:
+        import pypdf
+        reader = pypdf.PdfReader(pdf_path)
+        outline = reader.outline
+    except Exception:
+        return []
+    if not outline:
+        return []
+
+    def walk(items: list) -> list[str]:
+        titles: list[str] = []
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if isinstance(item, list):
+                titles.extend(walk(item))
+                index += 1
+                continue
+            title = (getattr(item, "title", "") or "").strip()
+            if title:
+                titles.append(title)
+            index += 1
+            if index < len(items) and isinstance(items[index], list):
+                titles.extend(walk(items[index]))
+                index += 1
+        return titles
+
+    return walk(outline)
 
 
 def extract_with_pdfminer(pdf_path: str) -> str | None:

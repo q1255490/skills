@@ -8,7 +8,7 @@
   "source": {
     "type": "skillssh",
     "ref": "kepano/obsidian-skills/obsidian-markdown",
-    "subpath": "skills\\obsidian-markdown",
+    "subpath": "plugins\\obsidian\\skills\\obsidian-markdown",
     "branch": null
   }
 }

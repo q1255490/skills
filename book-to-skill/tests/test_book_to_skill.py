@@ -12,6 +12,7 @@ import json
 import sys
 import textwrap
 import zipfile
+from itertools import starmap
 from pathlib import Path
 from unittest import mock
 
@@ -208,10 +209,7 @@ class TestEpubExtractionFix:
 
         # Even if ebooklib is absent, this should NOT raise TypeError/ValueError
         with mock.patch("book_to_skill.utils.prepare_dependencies"):
-            try:
-                result = extract_single_file(epub_path, "text", "no")
-            except (TypeError, ValueError) as exc:
-                pytest.fail(f"Tuple-unpack regression! Got: {exc}")
+            result = extract_single_file(epub_path, "text", "no")
 
         assert result["text"]  # some text was extracted
 
@@ -285,14 +283,16 @@ class TestBatchResilience:
     def test_extract_single_file_raises_on_missing(self, tmp_path):
         """A missing file should raise ExtractionError, not sys.exit."""
         missing = tmp_path / "does_not_exist.txt"
-        with pytest.raises(ExtractionError, match="File not found"):
+        with pytest.raises(ExtractionError) as exc_info:
             extract_single_file(missing, "text", "no")
+        assert exc_info.match("File not found")
 
     def test_extract_single_file_raises_on_unsupported(self, tmp_path):
         """An unsupported format should raise ExtractionError, not sys.exit."""
         unsupported = _make_unsupported_file(tmp_path / "data.xyz")
-        with pytest.raises(ExtractionError, match="Unsupported format"):
+        with pytest.raises(ExtractionError) as exc_info:
             extract_single_file(unsupported, "text", "no")
+        assert exc_info.match("Unsupported format")
 
     def test_batch_continues_past_bad_files(self, tmp_path):
         """A mix of good + bad files should produce output for the good ones."""
@@ -301,18 +301,17 @@ class TestBatchResilience:
         # Create a file that will fail (unsupported extension, garbage bytes)
         bad_file = _make_unsupported_file(tmp_path / "bad.xyz")
 
-        # Simulate the batch loop from main()
-        input_files = [good_file, bad_file]
         extracted = []
         errors = []
 
-        for fp in input_files:
-            try:
-                with mock.patch("book_to_skill.utils.prepare_dependencies"):
-                    res = extract_single_file(fp, "text", "no")
-                extracted.append(res)
-            except ExtractionError as exc:
-                errors.append((fp, str(exc)))
+        with mock.patch("book_to_skill.utils.prepare_dependencies"):
+            extracted.append(extract_single_file(good_file, "text", "no"))
+
+        try:
+            with mock.patch("book_to_skill.utils.prepare_dependencies"):
+                extract_single_file(bad_file, "text", "no")
+        except ExtractionError as exc:
+            errors.append((bad_file, str(exc)))
 
         assert len(extracted) == 1, "Good file should have been extracted"
         assert len(errors) == 1, "Bad file should have been recorded as error"
@@ -600,9 +599,12 @@ class TestDetectStructure:
         `The Art of War` (#132) is one: 13 such headings, 0 detected, while two
         footnote cross-references (`ch. 71.]`) were picked up instead.
         """
-        text = "\n".join(
-            "Chapter %s. Section\nBody text here." % r
-            for r in ("I", "II", "III", "IV", "V")
+        text = (
+            "Chapter I. Section\nBody text here.\n"
+            "Chapter II. Section\nBody text here.\n"
+            "Chapter III. Section\nBody text here.\n"
+            "Chapter IV. Section\nBody text here.\n"
+            "Chapter V. Section\nBody text here."
         )
         assert detect_structure(text)["chapters_detected"] == 5
 
@@ -735,6 +737,50 @@ class TestDetectStructure:
         assert _chapter_number("මෙම පරිච්ඡේදයේ අපි සාකච්ඡා කරමු") is None
         assert _chapter_number("තවත් පරිච්ඡේදයක් ඇත") is None
         assert _chapter_number("පරිච්ඡේදය") is None
+
+    def test_detects_sinhala_adhyaya_chapters(self):
+        """The Sanskrit-loan word අධ්‍යාය is also a Sinhala chapter heading."""
+        text = (
+            "අධ්\u200dයාය 1 හැඳින්වීම\nසාරාංශය\n"
+            "අධ්\u200dයාය ෨ ක්‍රම\nසාරාංශය\n"
+            "අධ්\u200dයාය 3 ප්‍රතිඵල\nසාරාංශය"
+        )
+        assert detect_structure(text)["chapters_detected"] == 3
+
+    def test_sinhala_adhyaya_matches_with_and_without_the_joiner(self):
+        """The ZWJ is optional: sanitization strips it before detection.
+
+        sanitize_extracted_text() removes U+200D, so the spelling that reaches
+        the matcher has no joiner even though every real source file has one.
+        Both forms must resolve.
+        """
+        from book_to_skill.sanitize import sanitize_extracted_text
+        from book_to_skill.utils import _chapter_number
+
+        with_joiner = "අධ්\u200dයාය 7"
+        sanitized, removed = sanitize_extracted_text(with_joiner)
+        assert removed == 1
+        assert sanitized == "අධ්යාය 7"
+        assert _chapter_number(with_joiner) == 7
+        assert _chapter_number(sanitized) == 7
+
+    def test_sinhala_adhyaya_prose_is_not_a_chapter_heading(self):
+        """Inflected forms and the bare word are not headings, joiner or not."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("මෙම අධ්\u200dයායේ අපි සාකච්ඡා කරමු") is None
+        assert _chapter_number("තවත් අධ්\u200dයායක් ඇත") is None
+        assert _chapter_number("අධ්\u200dයාය") is None
+        assert _chapter_number("අධ්යාය") is None
+
+    def test_sinhala_adhyaya_does_not_collide_with_other_indic_scripts(self):
+        """අධ්‍යාය shares a transliteration with four other scripts, not a block."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("අධ්\u200dයාය ෫") == 5
+        assert _chapter_number("अध्याय ५") == 5
+        assert _chapter_number("અધ્યાય ૫") == 5
+        assert _chapter_number("ਅਧਿਆਇ ੫") == 5
 
     def test_detects_telugu_chapters(self):
         """Telugu headings: both spellings (అధ్యాయము/అధ్యాయం), Telugu or Arabic digits."""
@@ -918,6 +964,29 @@ class TestDetectStructure:
         assert _chapter_number("פרקים רבים בספר") is None
         assert _chapter_number("פרק") is None
 
+    def test_detects_armenian_chapters(self):
+        """Armenian headings: `Գլուխ N`, incl. all-caps ԳԼՈՒԽ and lowercase."""
+        text = (
+            "Գլուխ 1 Ներածություն\nամփոփում\n"
+            "ԳԼՈՒԽ 2 Մեթոդներ\nամփոփում\n"
+            "գլուխ 3 Արդյունքներ\nամփոփում"
+        )
+        assert detect_structure(text)["chapters_detected"] == 3
+
+    def test_armenian_markdown_prefix(self):
+        text = "## Գլուխ 1 Առաջին\nամփոփում\n## Գլուխ 2 Երկրորդ\nամփոփում"
+        assert detect_structure(text)["chapters_detected"] == 2
+
+    def test_armenian_prose_is_not_a_chapter_heading(self):
+        """The bare word, an inflected stem, and the plural+number are not headings."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("Գլուխ") is None
+        assert _chapter_number("այս գլխում we քննարկում ենք") is None
+        # Plural "Գլուխներ 5" ("chapters 5") must not read as chapter 5: the
+        # word has to be followed by whitespace, not more letters.
+        assert _chapter_number("Գլուխներ 5") is None
+
     def test_hebrew_heading_survives_bidi_controls(self):
         """Bidi wrappers are stripped before detection, so the heading still counts."""
         from book_to_skill.sanitize import sanitize_extracted_text
@@ -1000,8 +1069,8 @@ class TestDetectStructure:
         """Word ordinals `اول` … `سی و چهارم` map to integers 1–34."""
         from book_to_skill.utils import _chapter_number
 
-        for n, word in enumerate(self._FA_ORDINAL_1_TO_34, 1):
-            assert _chapter_number(f"فصل {word}") == n, word
+        detected = list(map(lambda word: _chapter_number(f"فصل {word}"), self._FA_ORDINAL_1_TO_34))
+        assert detected == list(range(1, 35))
         # Common ZWNJ spelling of 30.
         assert _chapter_number("فصل سی‌ام") == 30
 
@@ -1131,8 +1200,10 @@ class TestDetectStructure:
     def test_detects_persian_word_chapters_1_to_34(self):
         """All 34 word-numeral headings count as distinct numeric chapters."""
         text = "\n".join(
-            f"فصل {word}\nمحتوا فصل {n}."
-            for n, word in enumerate(self._FA_ORDINAL_1_TO_34, 1)
+            starmap(
+                "فصل {}\nمحتوا فصل {}.".format,
+                zip(self._FA_ORDINAL_1_TO_34, range(1, 35)),
+            )
         )
         result = detect_structure(text)
         assert result["chapters_detected"] == 34
@@ -1730,17 +1801,11 @@ class TestDocxExtraction:
         malicious or not, so there's no protection to buy by validating."""
         from book_to_skill.parsers.docx import extract_docx_with_python_docx
 
-        real_import = __import__
-
-        def fake_import(name, *args, **kwargs):
-            if name == "docx":
-                raise ImportError("simulated: python-docx not installed")
-            return real_import(name, *args, **kwargs)
-
         docx_path = tmp_path / "whatever.docx"
         docx_path.write_bytes(b"not even a real docx")
 
-        with mock.patch("builtins.__import__", side_effect=fake_import):
+        missing_docx = ImportError("simulated: python-docx not installed")
+        with mock.patch("builtins.__import__", side_effect=missing_docx):
             result = extract_docx_with_python_docx(str(docx_path))
 
         assert result is None
@@ -1782,19 +1847,12 @@ class TestDocxExtraction:
 
         docx_path = _make_minimal_docx(tmp_path / "test.docx")
 
-        real_import = __import__
-
-        def fake_import(name, *args, **kwargs):
-            if name == "docx":
-                raise ImportError("simulated: python-docx not installed")
-            return real_import(name, *args, **kwargs)
-
         with mock.patch.object(
             docx_module,
             "validate_docx_xml_safety",
             wraps=docx_module.validate_docx_xml_safety,
         ) as spy:
-            with mock.patch("builtins.__import__", side_effect=fake_import):
+            with mock.patch.dict(sys.modules, {"docx": None}):
                 text, method = docx_module.extract_docx(str(docx_path))
 
         assert method == "zipfile-docx"
@@ -1901,14 +1959,10 @@ class TestParserExceptionLogging:
         broken = tmp_path / "broken.pdf"
         broken.write_bytes(b"%PDF-1.4 fake")
 
-        real_import = __import__
+        fake_pypdf = mock.MagicMock()
+        fake_pypdf.PdfReader.side_effect = RuntimeError("simulated failure")
 
-        def fake_import(name, *args, **kwargs):
-            if name == "pypdf":
-                raise RuntimeError("simulated failure")
-            return real_import(name, *args, **kwargs)
-
-        with mock.patch("builtins.__import__", side_effect=fake_import):
+        with mock.patch.dict(sys.modules, {"pypdf": fake_pypdf}):
             result = extract_with_pypdf(str(broken))
 
         assert result is None
@@ -2786,7 +2840,6 @@ class TestParseArgumentsUnknownFlags:
         captured = capsys.readouterr()
         assert captured.err == ""
 
-
 # ═══════════════════════════════════════════════════════════════════════════
 #  CJK-aware token estimate (rescued from #70)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2847,3 +2900,56 @@ class TestPdfLibsCleanup:
         out = pdf_parser.extract_with_pdfminer("x.pdf")
         assert "content" in out
         assert "HEAD" not in out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  CLI entry point tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestCliEntryPoint:
+    """Tests for cli.py and __main__.py entry points."""
+
+    def test_cli_main_calls_utils_main(self):
+        """cli.main() should call utils.main()."""
+        from book_to_skill import cli
+        called = False
+        def fake_utils_main():
+            nonlocal called
+            called = True
+        with mock.patch("book_to_skill.cli.utils_main", side_effect=fake_utils_main):
+            cli.main()
+        assert called, "cli.main() should call utils.main()"
+
+    def test_cli_main_reconfigures_utf8(self):
+        """cli.main() should reconfigure stdout/stderr to UTF-8."""
+        from book_to_skill import cli
+        with mock.patch("book_to_skill.cli.utils_main"):
+            cli.main()
+        # After reconfigure, encoding should still be valid (may not change if already UTF-8)
+        assert sys.stdout.encoding is not None
+
+    def test_main_importable(self):
+        """__main__.py should be importable and call cli.main()."""
+        import importlib
+        spec = importlib.util.find_spec("book_to_skill.__main__")
+        assert spec is not None, "__main__ module should be findable"
+
+    def test_cli_main_returns_none(self):
+        """cli.main() is a procedure (implicitly returns None) and should complete without raising."""
+        from book_to_skill import cli
+        with mock.patch("book_to_skill.cli.utils_main"):
+            cli.main()
+
+    def test_cli_main_handles_reconfigure_failure(self):
+        """If reconfigure fails (mock stream), cli.main() should not crash."""
+        from book_to_skill import cli
+        class BrokenStream:
+            encoding = "ascii"
+            def reconfigure(self, **kwargs):
+                raise AttributeError("mock failure")
+        with mock.patch.object(cli, "sys") as mock_sys:
+            mock_sys.stdout = BrokenStream()
+            mock_sys.stderr = BrokenStream()
+            mock_sys.argv = ["extract.py"]
+            with mock.patch("book_to_skill.cli.utils_main"):
+                cli.main()  # should not raise

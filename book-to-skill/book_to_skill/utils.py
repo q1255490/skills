@@ -7,6 +7,7 @@ import os
 import re
 import statistics
 import sys
+import tempfile
 from collections import Counter
 
 import shutil
@@ -38,12 +39,16 @@ from book_to_skill.parsers.docx import extract_docx
 from book_to_skill.parsers.rtf import extract_rtf
 from book_to_skill.parsers.calibre import extract_with_ebook_convert
 from book_to_skill.parsers.pdf import (
+    _PART_HEADER,
     extract_with_docling,
     extract_with_pdftotext,
     extract_with_pypdf,
     extract_with_pdfminer,
+    extract_pypdf_page_records,
     looks_image_only,
     count_pages,
+    pdf_outline_titles,
+    pdf_outline_all_titles,
 )
 from book_to_skill.parsers.epub import (
     extract_with_ebooklib,
@@ -243,19 +248,27 @@ _TA_CHAPTER = re.compile(
     rf"^\s*(?:#{{1,6}}\s+)?அத்தியாயம்\s*([0-9{_TA_DIGITS}]+)\b"
 )
 
-# Sinhala chapter headings: "පරිච්ඡේදය 1", "පරිච්ඡේදය ෨", "## පරිච්ඡේදය 2".
-# පරිච්ඡේදය ("chapter") + a number. Grouped next to Tamil as the other Sri
-# Lankan script. Modern Sinhala prints numbers with ASCII digits; the Lith
-# digits (U+0DE6-U+0DEF) are included for historical texts, remapped like the
-# other Indic blocks. Only පරිච්ඡේදය is matched, not the Sanskrit loan අධ්‍යාය:
-# that word carries a ZERO WIDTH JOINER inside its conjunct, and
-# sanitize_extracted_text() strips U+200D before detect_structure() ever sees
-# the text, so a pattern containing one could never match. Requiring a number
-# keeps prose that merely inflects the word ("පරිච්ඡේදයේ") from matching.
+# Sinhala chapter headings: "පරිච්ඡේදය 1", "අධ්‍යාය ෨", "## පරිච්ඡේදය 2".
+# Two words are used: පරිච්ඡේදය and the Sanskrit loan අධ්‍යාය. Grouped next to
+# Tamil as the other Sri Lankan script. Modern Sinhala prints numbers with ASCII
+# digits; the Lith digits (U+0DE6-U+0DEF) are included for historical texts,
+# remapped like the other Indic blocks.
+#
+# The joiner in අධ්‍යාය is matched optionally, and that is deliberate: the word
+# carries a ZERO WIDTH JOINER inside its ධ්‍ය conjunct, but
+# sanitize_extracted_text() strips U+200D before detect_structure() ever runs, so
+# the spelling that reaches this pattern has no joiner even though every real
+# source file has one. "\u200d?" matches both, which keeps the pattern working
+# for callers that reach _chapter_number() without sanitizing first.
+#
+# අධ්‍යාය shares its transliteration with Devanagari अध्याय, Gujarati અધ્યાય and
+# Gurmukhi ਅਧਿਆਇ, but Sinhala occupies U+0D80-U+0DFF and none of those blocks
+# overlap it, so the matchers cannot see each other's text. Requiring a number
+# keeps prose that merely inflects a word ("පරිච්ඡේදයේ", "අධ්‍යායේ") from matching.
 _SI_DIGITS = "෦-෯"
 _SI_DIGIT_MAP = str.maketrans("෦෧෨෩෪෫෬෭෮෯", "0123456789")
 _SI_CHAPTER = re.compile(
-    rf"^\s*(?:#{{1,6}}\s+)?පරිච්ඡේදය\s*([0-9{_SI_DIGITS}]+)\b"
+    rf"^\s*(?:#{{1,6}}\s+)?(?:පරිච්ඡේදය|අධ්\u200d?යාය)\s*([0-9{_SI_DIGITS}]+)\b"
 )
 
 # Telugu chapter headings: "అధ్యాయము 1", "అధ్యాయం ౧", "## అధ్యాయం 2".
@@ -353,6 +366,17 @@ _EL_CHAPTER = re.compile(r"^\s*(?:#{1,6}\s+)?κεφ[άα]λαιο\s+([0-9]+)\b",
 # a number. Gematria numbering ("פרק א"), common in religious texts, is a separate
 # letter-to-number mapping and is deliberately not handled here.
 _HE_CHAPTER = re.compile(r"^\s*(?:#{1,6}\s+)?פרק\s+([0-9]+)\b")
+
+# Armenian chapter headings: "Գլուխ 1", "ԳԼՈՒԽ 12", "## Գլուխ 2".
+# "Գլուխ" ("chapter") + a number, with ordinary Arabic digits so no remap is
+# needed. Armenian is bicameral and — unlike Greek above — its case mapping
+# round-trips exactly ("Գլուխ".upper() == "ԳԼՈՒԽ" letter for letter), so plain
+# re.IGNORECASE is enough and no letter class is required. The word also means
+# "head", so requiring *whitespace* then a number does the guarding: an
+# inflected form elides the ու stem vowel ("գլխում") and so shares no prefix,
+# and the plural keeps the word intact, which is why \s+ matters — it stops
+# "Գլուխներ 5" ("chapters 5") from reading as chapter 5.
+_HY_CHAPTER = re.compile(r"^\s*(?:#{1,6}\s+)?գլուխ\s+([0-9]+)\b", re.IGNORECASE)
 
 # Korean chapter headings: "제1장 총칙", "## 제4장 근로시간과 휴식", "제6장의2 …".
 # 제 + Arabic numeral + a classifier (장 chapter / 편 part / 절 section / 관
@@ -482,6 +506,7 @@ _TOC_PATTERN = re.compile(
 # front/back matter; instructional titles such as "Indexing Strategies" and
 # "Glossary of Terms" must remain chapters.
 _FRONT_MATTER_HEADERS = (
+    "cover",
     "preface",
     "foreword",
     "acknowledgements",
@@ -507,7 +532,6 @@ _BACK_MATTER_HEADERS = (
 )
 _NON_CHAPTER_HEADERS = frozenset((*_FRONT_MATTER_HEADERS, *_BACK_MATTER_HEADERS))
 _NON_CHAPTER_PREFIX = re.compile(r"^(?:appendix|appendices)\b", re.IGNORECASE)
-_PART_HEADER = re.compile(r"^part\s+(?:\d+|[ivxlcdm]+)\b", re.IGNORECASE)
 
 
 def _is_non_chapter_section(title: str) -> bool:
@@ -519,6 +543,7 @@ def _is_non_chapter_section(title: str) -> bool:
         or bool(_NON_CHAPTER_PREFIX.match(normalized))
         or bool(_PART_HEADER.match(normalized))
     )
+
 
 # ATX-style heading: "# Title", "## Section", AsciiDoc "= Title", "== Section".
 # The required space after the marker distinguishes an AsciiDoc "== X" from a
@@ -857,6 +882,9 @@ def _match_chapter_number(
     hem = _HE_CHAPTER.match(s)
     if hem:
         return int(hem.group(1))
+    hym = _HY_CHAPTER.match(s)
+    if hym:
+        return int(hym.group(1))
 
     km = _KO_CHAPTER.match(s)
     if km:
@@ -882,7 +910,7 @@ def _chapter_number(line: str, prev_line: str | None = None) -> int | None:
     Bengali ("অধ্যায় 1", "অধ্যায় ১", "## অধ্যায় 2"),
     Odia ("ଅଧ୍ୟାୟ 1", "ଅଧ୍ୟାୟ ୧", "## ଅଧ୍ୟାୟ 2"),
     Tamil ("அத்தியாயம் 1", "அத்தியாயம் ௧", "## அத்தியாயம் 2"),
-    Sinhala ("පරිච්ඡේදය 1", "පරිච්ඡේදය ෨", "## පරිච්ඡේදය 2"),
+    Sinhala ("පරිච්ඡේදය 1", "අධ්‍යාය ෨", "## පරිච්ඡේදය 2"),
     Telugu ("అధ్యాయము 1", "అధ్యాయం ౧", "## అధ్యాయం 2"),
     Kannada ("ಅಧ್ಯಾಯ 1", "ಅಧ್ಯಾಯ ೧", "## ಅಧ್ಯಾಯ 2"),
     Malayalam ("അധ്യായം 1", "അധ്യായം ൧", "## അദ്ധ്യായം 2"),
@@ -891,6 +919,7 @@ def _chapter_number(line: str, prev_line: str | None = None) -> int | None:
     Russian ("Глава 1", "ГЛАВА 12", "## Глава 2"),
     Greek ("Κεφάλαιο 1", "ΚΕΦΑΛΑΙΟ 12", "## Κεφάλαιο 2"),
     Hebrew ("פרק 1", "פרק 12", "## פרק 2"),
+    Armenian ("Գլուխ 1", "ԳԼՈՒԽ 12", "## Գլուխ 2"),
     Korean ("제1장 총칙", "## 제4장 근로시간과 휴식"), and
     Persian ("فصل ۱", "فصل اول", "فصل بیست و یکم", "بخش ۲: مفاهیم",
     "## فصل ۱: مقدمه", PDF-glued "فصل سی و چهارمخداحافظ…") heading styles — each
@@ -916,6 +945,162 @@ def _chapter_number(line: str, prev_line: str | None = None) -> int | None:
     if md:
         return _match_chapter_number(s[md.end():], heading_marked=True)
     return None
+
+
+def _line_title_text(line: str) -> str:
+    """Normalize a source line to its heading title, if any."""
+    stripped = line.strip()
+    match = _ATX_HEADING.match(stripped)
+    return match.group(2).strip() if match else stripped
+
+
+_TOC_LEADER = re.compile(r"\.{3,}")
+_PAGE_CHAPTER_HEADER = re.compile(r"^\d+\s*\|\s*Chapter\s+\d", re.IGNORECASE)
+_CHAPTER_MARKER = re.compile(r"^\s*CHAPTER\s+\d+\s*$", re.IGNORECASE)
+_OUTLINE_CHAPTER_PREFIX = re.compile(r"^chapter\s+\d+[.:]?\s*", re.IGNORECASE)
+
+
+def _outline_bare_title(outline_title: str) -> str:
+    return _OUTLINE_CHAPTER_PREFIX.sub("", outline_title.strip(), count=1).strip()
+
+
+def _normalized_heading(line: str) -> str:
+    return _line_title_text(line).strip().rstrip(".").casefold()
+
+
+def _is_disqualified_chapter_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if _PAGE_CHAPTER_HEADER.match(stripped):
+        return True
+    if _TOC_LEADER.search(stripped):
+        return True
+    return False
+
+
+def _chapter_start_at(lines: list[str], title_line: int) -> int:
+    if title_line > 0 and _CHAPTER_MARKER.match(lines[title_line - 1].strip()):
+        return title_line - 1
+    return title_line
+
+
+def _line_matches_outline_title(lines: list[str], index: int, outline_title: str) -> int | None:
+    """Return the 0-based start line if *outline_title* begins at *index*, else None."""
+    if _is_disqualified_chapter_line(lines[index]):
+        return None
+    bare = _outline_bare_title(outline_title)
+    full_cf = outline_title.strip().casefold()
+    bare_cf = bare.casefold()
+    line = lines[index].strip()
+    heading_cf = _normalized_heading(lines[index])
+
+    if heading_cf == bare_cf or heading_cf == full_cf or line.casefold() == bare_cf:
+        return _chapter_start_at(lines, index)
+
+    if index + 1 < len(lines) and not _is_disqualified_chapter_line(lines[index + 1]):
+        combined = f"{line} {lines[index + 1].strip()}".casefold()
+        if combined == bare_cf or combined == full_cf:
+            return _chapter_start_at(lines, index)
+
+    if _CHAPTER_MARKER.match(line):
+        for look in range(index + 1, min(index + 4, len(lines))):
+            if _is_disqualified_chapter_line(lines[look]):
+                continue
+            if _normalized_heading(lines[look]) == bare_cf:
+                return index
+            if look + 1 < len(lines) and not _is_disqualified_chapter_line(lines[look + 1]):
+                pair = f"{lines[look].strip()} {lines[look + 1].strip()}".casefold()
+                if pair == bare_cf:
+                    return index
+    return None
+
+
+def _find_outline_chapter_start(lines: list[str], title: str, start: int) -> int | None:
+    """0-based line index where the outline chapter begins in extracted text."""
+    for index in range(start, len(lines)):
+        found = _line_matches_outline_title(lines, index, title)
+        if found is not None:
+            return found
+    return None
+
+
+def _is_isolated_heading_line(lines: list[str], index: int) -> bool:
+    if not lines[index].strip():
+        return False
+    prev_blank = index == 0 or not lines[index - 1].strip()
+    next_blank = index + 1 >= len(lines) or not lines[index + 1].strip()
+    return prev_blank and next_blank
+
+
+def _is_chapter_content_boundary(
+    lines: list[str], index: int, range_end_titles: frozenset[str]
+) -> bool:
+    """True when a book- or part-level framing heading ends the chapter body."""
+    stripped = lines[index].strip()
+    if not stripped or _PAGE_CHAPTER_HEADER.match(stripped):
+        return False
+    heading_cf = _normalized_heading(lines[index])
+    if heading_cf in range_end_titles:
+        return True
+    title = _line_title_text(lines[index])
+    if _PART_HEADER.match(title) or _NON_CHAPTER_PREFIX.match(title):
+        return _is_isolated_heading_line(lines, index)
+    return False
+
+
+def _first_chapter_boundary(
+    lines: list[str], start: int, limit: int, range_end_titles: frozenset[str]
+) -> int:
+    """Earliest line in [start, limit) that ends the preceding chapter body."""
+    for index in range(start, limit):
+        if _is_chapter_content_boundary(lines, index, range_end_titles):
+            return index
+    return limit
+
+
+def _range_end_title_keys(titles: list[str]) -> frozenset[str]:
+    return frozenset(_normalized_heading(title) for title in titles if title.strip())
+
+
+def chapter_line_ranges(
+    text: str,
+    chapter_titles: list[str],
+    *,
+    range_end_titles: list[str] | None = None,
+) -> list[dict[str, int | str]]:
+    """1-based inclusive line ranges for outline chapters in *text*."""
+    lines = text.splitlines()
+    end_keys = _range_end_title_keys(range_end_titles or [])
+    starts: list[tuple[str, int]] = []
+    cursor = 0
+    for title in chapter_titles:
+        line_index = _find_outline_chapter_start(lines, title, cursor)
+        if line_index is None:
+            print(
+                f"WARNING: outline chapter not found in extracted text: {title!r}",
+                file=sys.stderr,
+            )
+            continue
+        starts.append((title, line_index))
+        cursor = line_index + 1
+    if not starts:
+        return []
+
+    ranges: list[dict[str, int | str]] = []
+    for index, (title, start_line) in enumerate(starts):
+        next_start = starts[index + 1][1] if index + 1 < len(starts) else len(lines)
+        end_exclusive = _first_chapter_boundary(
+            lines, start_line + 1, next_start, end_keys
+        )
+        ranges.append(
+            {
+                "title": title,
+                "start_line": start_line + 1,
+                "end_line": end_exclusive,
+            }
+        )
+    return ranges
 
 
 def detect_structure(text: str) -> dict:
@@ -1010,6 +1195,30 @@ def detect_structure(text: str) -> dict:
     }
 
 
+def apply_pdf_outline(structure: dict, pdf_path: str) -> dict:
+    """Prefer the PDF's embedded outline over the text heuristics.
+
+    The text scan treats any short line starting with a number and two spaces
+    ("1  Introduction") as a chapter heading, so page-layout lines such as
+    numbered figure/listing captions and ToC rows inflate a technical book to
+    hundreds of "chapters". A publisher outline is authoritative; the
+    heuristics remain the fallback when the PDF has none.
+    """
+    titles = [t for t in pdf_outline_titles(pdf_path) if not _is_non_chapter_section(t)]
+    if len(titles) < 2:
+        return structure
+    all_titles = pdf_outline_all_titles(pdf_path)
+    range_end_titles = [t for t in all_titles if _is_non_chapter_section(t)]
+    return {
+        **structure,
+        "chapters_detected": len(titles),
+        "chapters_method": "outline",
+        "chapter_headings_sample": titles[:10],
+        "chapter_titles": titles,
+        "chapter_range_end_titles": range_end_titles,
+    }
+
+
 def parse_arguments(argv: list[str]) -> tuple[list[str], str, str]:
     """Parse argv into (input_paths, extraction_mode, install_mode)."""
     input_paths = []
@@ -1031,6 +1240,8 @@ def parse_arguments(argv: list[str]) -> tuple[list[str], str, str]:
             else:
                 i += 1
         elif arg == "--no-install-missing":
+            i += 1
+        elif arg == "--pdf-page-sidecar":
             i += 1
         elif arg.startswith("-"):
             print(f"WARNING: Unknown flag '{arg}' — ignoring it.", file=sys.stderr)
@@ -1257,6 +1468,14 @@ def extract_single_file(input_path: Path, extraction_mode: str, install_mode: st
     
     if ext == ".epub":
         print(f"Extracting EPUB: {input_str}")
+        if extraction_mode == "technical":
+            fallback_reason = "format_not_supported_in_technical_mode"
+            print(
+                "WARNING: Technical mode is not supported for EPUB; "
+                "using the EPUB text extraction chain. "
+                "Layout-aware extraction was not used.",
+                file=sys.stderr,
+            )
         text = extract_with_ebooklib(input_str)
         if text and text.strip():
             method = "ebooklib"
@@ -1408,6 +1627,8 @@ def extract_single_file(input_path: Path, extraction_mode: str, install_mode: st
 
     tokens = estimate_tokens(text)
     structure = detect_structure(text)
+    if ext == ".pdf":
+        structure = apply_pdf_outline(structure, input_str)
     print(
         f"  chapters: {structure['chapters_detected']} "
         f"({structure['chapters_method']})"
@@ -1465,6 +1686,73 @@ def prepare_output_dir(path: Path) -> None:
         path.mkdir(parents=True, mode=0o700)
 
 
+def write_pdf_page_sidecar(sources: list[dict], output_dir: Path) -> Path | None:
+    """Write opt-in physical-page evidence without changing legacy outputs.
+
+    pypdf's page text is a separate text-layer view, not a character-offset map
+    into ``full_text.txt``. When the main extractor differs, mark that explicitly.
+    A source whose hash changes between extraction and this pass gets no page
+    evidence, so citations cannot silently refer to a different PDF revision.
+    """
+    entries = []
+    for source in sources:
+        if source["format"] != "pdf":
+            continue
+        entry = {
+            "source_file": source["source_file"],
+            "source_sha256": source["sha256"],
+            "full_text_extraction_method": source["extraction_method"],
+            "page_text_extraction_method": "pypdf",
+            "status": "unavailable",
+            "pages": [],
+        }
+        try:
+            if _sha256_file(source["source_file"]) != source["sha256"]:
+                entry["reason"] = "source_changed_since_extraction"
+            else:
+                records = extract_pypdf_page_records(source["source_file"])
+                if _sha256_file(source["source_file"]) != source["sha256"]:
+                    entry["reason"] = "source_changed_during_page_extraction"
+                elif records is None:
+                    entry["reason"] = "pypdf_unavailable_or_failed"
+                else:
+                    entry["status"] = "ok"
+                    if source["pages"] and len(records) != source["pages"]:
+                        entry["low_confidence_reasons"] = ["page_count_mismatch"]
+                    for record in records:
+                        record["source_sha256"] = source["sha256"]
+                        if source["extraction_method"] != "pypdf":
+                            record["low_confidence_reasons"].append(
+                                "different_extractor_from_full_text"
+                            )
+                        record["requires_manual_review"] = bool(
+                            record["low_confidence_reasons"]
+                        )
+                    entry["pages"] = records
+        except OSError as exc:
+            entry["reason"] = f"source_unreadable: {type(exc).__name__}"
+        entries.append(entry)
+
+    payload = {"schema_version": 1, "sources": entries}
+    destination = output_dir / "pdf_pages.json"
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n", dir=output_dir,
+            prefix=".pdf_pages-", suffix=".tmp", delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump(payload, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+        os.replace(temporary, destination)
+    except OSError as exc:
+        print(f"  [warn] could not write PDF page sidecar: {exc}", file=sys.stderr)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        return None
+    return destination
+
+
 def print_intro() -> None:
     """Two lines of attribution at the start of every run.
 
@@ -1502,7 +1790,8 @@ def print_usage() -> None:
     """Print standalone CLI usage."""
     print(
         "Usage: book-to-skill <path-to-document-folder-or-glob>... "
-        "[--mode technical|text] [--install-missing ask|yes|no]",
+        "[--mode technical|text] [--install-missing ask|yes|no] "
+        "[--pdf-page-sidecar]",
         file=sys.stderr,
     )
     print(
@@ -1587,6 +1876,25 @@ def main():
     # headings and make the result depend on the source-path length.
     structure_text = "\n\n".join(src["text"] for src in extracted_sources)
     consolidated_structure = detect_structure(structure_text)
+    if len(extracted_sources) == 1 and extracted_sources[0]["chapters_method"] == "outline":
+        # The outline came from the file, not the text; a re-scan would lose it.
+        src = extracted_sources[0]
+        consolidated_structure.update(
+            {k: src[k] for k in (
+                "chapters_detected",
+                "chapters_method",
+                "chapter_headings_sample",
+                "chapter_titles",
+            ) if k in src}
+        )
+        chapter_titles = src.get("chapter_titles")
+        if chapter_titles:
+            end_titles = src.get("chapter_range_end_titles")
+            consolidated_structure["chapter_ranges"] = chapter_line_ranges(
+                consolidated_text,
+                chapter_titles,
+                range_end_titles=end_titles,
+            )
     structural_sources = [
         src for src in extracted_sources
         if src["chapters_method"] == "structural" and src["chapters_detected"] >= 2
@@ -1656,6 +1964,22 @@ def main():
                 "chapters_detected": src["chapters_detected"],
                 "chapters_method": src["chapters_method"],
                 "chapter_headings_sample": src["chapter_headings_sample"],
+                **(
+                    {"chapter_titles": src["chapter_titles"]}
+                    if "chapter_titles" in src
+                    else {}
+                ),
+                **(
+                    {
+                        "chapter_ranges": chapter_line_ranges(
+                            src["text"],
+                            src["chapter_titles"],
+                            range_end_titles=src.get("chapter_range_end_titles"),
+                        )
+                    }
+                    if "chapter_titles" in src
+                    else {}
+                ),
                 "has_toc": src["has_toc"]
             }
             for src in extracted_sources
@@ -1671,6 +1995,10 @@ def main():
     OUTPUT_META.write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
     )
+
+    page_sidecar = None
+    if "--pdf-page-sidecar" in sys.argv[1:]:
+        page_sidecar = write_pdf_page_sidecar(extracted_sources, OUTPUT_DIR)
     
     page_line = f"   Total Pages: {total_pages}"
     print("\nExtraction complete:")
@@ -1703,6 +2031,8 @@ def main():
     print(f"\n   Workdir -> {OUTPUT_DIR}")
     print(f"   Text    -> {OUTPUT_TEXT}")
     print(f"   Meta    -> {OUTPUT_META}")
+    if page_sidecar is not None:
+        print(f"   PDF pages -> {page_sidecar}")
     if errors:
         print(f"\n   WARNING: {len(errors)} source(s) skipped due to errors:")
         for path, err in errors:
